@@ -232,6 +232,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			p.handleError(p.ctx, p.prefix, p.account, resp.StatusCode, resp.Header, respBody, p.requestedModel, p.groupID, p.sessionHash, p.isStickySession)
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d rate_limited account=%d (no model mapping)", p.prefix, resp.StatusCode, p.account.ID)
 		}
+		s.clearStickySession(p.ctx, p.groupID, p.sessionHash)
 
 		// 返回账号切换信号，让上层切换账号重试
 		return &smartRetryResult{
@@ -393,9 +394,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 		s.setAntigravityModelRateLimits(p.ctx, p.accountRepo, p.account, modelName, p.prefix, resp.StatusCode, resetAt, true)
 
 		// 清除粘性会话绑定，避免下次请求仍命中限流账号
-		if s.cache != nil && p.sessionHash != "" {
-			_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
-		}
+		s.clearStickySession(p.ctx, p.groupID, p.sessionHash)
 
 		// 返回账号切换信号，让上层切换账号重试
 		return &smartRetryResult{
@@ -928,8 +927,14 @@ func (s *AntigravityGatewayService) checkErrorPolicy(ctx context.Context, accoun
 func (s *AntigravityGatewayService) applyErrorPolicy(p antigravityRetryLoopParams, statusCode int, headers http.Header, respBody []byte) (handled bool, outStatus int, retErr error) {
 	switch s.checkErrorPolicy(p.ctx, p.account, statusCode, respBody) {
 	case ErrorPolicySkipped:
+		if s.handleAntigravityModelRateLimitBeforePolicy(p, statusCode, headers, respBody) {
+			return true, statusCode, nil
+		}
 		return true, http.StatusInternalServerError, nil
 	case ErrorPolicyMatched:
+		if s.handleAntigravityModelRateLimitBeforePolicy(p, statusCode, headers, respBody) {
+			return true, statusCode, nil
+		}
 		_ = p.handleError(p.ctx, p.prefix, p.account, statusCode, headers, respBody,
 			p.requestedModel, p.groupID, p.sessionHash, p.isStickySession)
 		return true, statusCode, nil
@@ -939,6 +944,31 @@ func (s *AntigravityGatewayService) applyErrorPolicy(p antigravityRetryLoopParam
 		return true, statusCode, &AntigravityAccountSwitchError{OriginalAccountID: p.account.ID, RateLimitedModel: p.requestedModel, IsStickySession: p.isStickySession}
 	}
 	return false, statusCode, nil
+}
+
+func (s *AntigravityGatewayService) handleAntigravityModelRateLimitBeforePolicy(p antigravityRetryLoopParams, statusCode int, headers http.Header, respBody []byte) bool {
+	if statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	if p.account == nil || p.account.Platform != PlatformAntigravity {
+		return false
+	}
+	_, shouldRateLimitModel, waitDuration, modelName, isModelCapacityExhausted := shouldTriggerAntigravitySmartRetry(p.account, respBody)
+	if isModelCapacityExhausted || !shouldRateLimitModel || strings.TrimSpace(modelName) == "" {
+		return false
+	}
+	rateLimitDuration := waitDuration
+	if rateLimitDuration <= 0 {
+		rateLimitDuration = antigravityDefaultRateLimitDuration
+	}
+	resetAt := time.Now().Add(rateLimitDuration)
+	if !s.setAntigravityModelRateLimits(p.ctx, p.accountRepo, p.account, modelName, p.prefix, statusCode, resetAt, false) {
+		return false
+	}
+	s.clearStickySession(p.ctx, p.groupID, p.sessionHash)
+	logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limited_before_error_policy model=%s account=%d reset_in=%v",
+		p.prefix, statusCode, modelName, p.account.ID, rateLimitDuration)
+	return true
 }
 
 // mapAntigravityModel 获取映射后的模型名
@@ -2048,8 +2078,28 @@ func stripSignatureSensitiveBlocksFromClaudeRequest(req *antigravity.ClaudeReque
 //	      └─ retryDelay <  7s → 等待后重试 1 次
 //	          ├─ 成功 → 正常返回
 //	          └─ 失败 → 设置模型限流 + 清除粘性绑定 → 切换账号
-func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Context, account *Account, originalModel string, action string, stream bool, body []byte, isStickySession bool) (*ForwardResult, error) {
+type ForwardGeminiOption func(*forwardGeminiOptions)
+
+type forwardGeminiOptions struct {
+	groupID     int64
+	sessionHash string
+}
+
+func WithForwardGeminiSession(groupID int64, sessionHash string) ForwardGeminiOption {
+	return func(opts *forwardGeminiOptions) {
+		opts.groupID = groupID
+		opts.sessionHash = sessionHash
+	}
+}
+
+func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Context, account *Account, originalModel string, action string, stream bool, body []byte, isStickySession bool, options ...ForwardGeminiOption) (*ForwardResult, error) {
 	startTime := time.Now()
+	forwardOpts := forwardGeminiOptions{}
+	for _, apply := range options {
+		if apply != nil {
+			apply(&forwardOpts)
+		}
+	}
 
 	sessionID := getSessionID(c)
 	prefix := logPrefix(sessionID, account.Name)
@@ -2154,8 +2204,8 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		handleError:     s.handleUpstreamError,
 		requestedModel:  originalModel,
 		isStickySession: isStickySession, // ForwardGemini 由上层判断粘性会话
-		groupID:         0,               // ForwardGemini 方法没有 groupID，由上层处理粘性会话清除
-		sessionHash:     "",              // ForwardGemini 方法没有 sessionHash，由上层处理粘性会话清除
+		groupID:         forwardOpts.groupID,
+		sessionHash:     forwardOpts.sessionHash,
 	})
 	if err != nil {
 		// 检查是否是账号切换信号，转换为 UpstreamFailoverError 让 Handler 切换账号
@@ -2253,8 +2303,8 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 					handleError:     s.handleUpstreamError,
 					requestedModel:  originalModel,
 					isStickySession: isStickySession,
-					groupID:         0,
-					sessionHash:     "",
+					groupID:         forwardOpts.groupID,
+					sessionHash:     forwardOpts.sessionHash,
 				})
 				if retryErr == nil {
 					retryResp := retryResult.resp
@@ -2330,7 +2380,7 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		if unwrapErr != nil || len(unwrappedForOps) == 0 {
 			unwrappedForOps = respBody
 		}
-		s.handleUpstreamError(ctx, prefix, account, resp.StatusCode, resp.Header, respBody, originalModel, 0, "", isStickySession)
+		s.handleUpstreamError(ctx, prefix, account, resp.StatusCode, resp.Header, respBody, originalModel, forwardOpts.groupID, forwardOpts.sessionHash, isStickySession)
 		upstreamMsg := strings.TrimSpace(extractAntigravityErrorMessage(unwrappedForOps))
 		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 		upstreamDetail := s.getUpstreamErrorDetail(unwrappedForOps)
@@ -2558,6 +2608,15 @@ func (s *AntigravityGatewayService) setAntigravityModelRateLimits(ctx context.Co
 		}
 	}
 	return success
+}
+
+func (s *AntigravityGatewayService) clearStickySession(ctx context.Context, groupID int64, sessionHash string) {
+	if s == nil || s.cache == nil || strings.TrimSpace(sessionHash) == "" {
+		return
+	}
+	if err := s.cache.DeleteSessionAccountID(ctx, groupID, sessionHash); err != nil {
+		logger.LegacyPrintf("service.antigravity_gateway", "[antigravity-Forward] sticky_session_clear_failed group_id=%d session=%s err=%v", groupID, shortSessionHash(sessionHash), err)
+	}
 }
 
 func antigravityFallbackCooldownSeconds() (time.Duration, bool) {
