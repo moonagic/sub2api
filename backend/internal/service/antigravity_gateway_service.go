@@ -228,11 +228,9 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			p.prefix, resp.StatusCode, modelName, p.account.ID, rateLimitDuration, truncateForLog(respBody, 200))
 
 		resetAt := time.Now().Add(rateLimitDuration)
-		if !setModelRateLimitByModelName(p.ctx, p.accountRepo, p.account.ID, modelName, p.prefix, resp.StatusCode, resetAt, false) {
+		if !s.setAntigravityModelRateLimits(p.ctx, p.accountRepo, p.account, modelName, p.prefix, resp.StatusCode, resetAt, false) {
 			p.handleError(p.ctx, p.prefix, p.account, resp.StatusCode, resp.Header, respBody, p.requestedModel, p.groupID, p.sessionHash, p.isStickySession)
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d rate_limited account=%d (no model mapping)", p.prefix, resp.StatusCode, p.account.ID)
-		} else {
-			s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
 		}
 
 		// 返回账号切换信号，让上层切换账号重试
@@ -392,15 +390,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			p.prefix, resp.StatusCode, maxAttempts, modelName, p.account.ID, rateLimitDuration, truncateForLog(retryBody, 200))
 
 		resetAt := time.Now().Add(rateLimitDuration)
-		if p.accountRepo != nil && modelName != "" {
-			if err := p.accountRepo.SetModelRateLimit(p.ctx, p.account.ID, modelName, resetAt); err != nil {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limit_failed model=%s error=%v", p.prefix, resp.StatusCode, modelName, err)
-			} else {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limited_after_smart_retry model=%s account=%d reset_in=%v",
-					p.prefix, resp.StatusCode, modelName, p.account.ID, rateLimitDuration)
-				s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
-			}
-		}
+		s.setAntigravityModelRateLimits(p.ctx, p.accountRepo, p.account, modelName, p.prefix, resp.StatusCode, resetAt, true)
 
 		// 清除粘性会话绑定，避免下次请求仍命中限流账号
 		if s.cache != nil && p.sessionHash != "" {
@@ -2551,6 +2541,25 @@ func setModelRateLimitByModelName(ctx context.Context, repo AccountRepository, a
 	return true
 }
 
+func (s *AntigravityGatewayService) setAntigravityModelRateLimits(ctx context.Context, repo AccountRepository, account *Account, modelName, prefix string, statusCode int, resetAt time.Time, afterSmartRetry bool) bool {
+	if account == nil || repo == nil {
+		return false
+	}
+	keys := antigravityModelRateLimitKeys(modelName)
+	if len(keys) == 0 {
+		return false
+	}
+
+	success := false
+	for _, key := range keys {
+		if setModelRateLimitByModelName(ctx, repo, account.ID, key, prefix, statusCode, resetAt, afterSmartRetry) {
+			s.updateAccountModelRateLimitInCache(ctx, account, key, resetAt)
+			success = true
+		}
+	}
+	return success
+}
+
 func antigravityFallbackCooldownSeconds() (time.Duration, bool) {
 	raw := strings.TrimSpace(os.Getenv(antigravityFallbackSecondsEnv))
 	if raw == "" {
@@ -2803,13 +2812,7 @@ func (s *AntigravityGatewayService) setModelRateLimitAndClearSession(p *handleMo
 	logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limited model=%s account=%d reset_in=%v",
 		p.prefix, p.statusCode, info.ModelName, p.account.ID, info.RetryDelay)
 
-	// 设置模型限流状态（数据库）
-	if err := s.accountRepo.SetModelRateLimit(p.ctx, p.account.ID, info.ModelName, resetAt); err != nil {
-		logger.LegacyPrintf("service.antigravity_gateway", "%s model_rate_limit_failed model=%s error=%v", p.prefix, info.ModelName, err)
-	}
-
-	// 立即更新 Redis 快照中账号的限流状态，避免并发请求重复选中
-	s.updateAccountModelRateLimitInCache(p.ctx, p.account, info.ModelName, resetAt)
+	s.setAntigravityModelRateLimits(p.ctx, s.accountRepo, p.account, info.ModelName, p.prefix, p.statusCode, resetAt, false)
 
 	// 清除粘性会话绑定
 	if p.cache != nil && p.sessionHash != "" {
@@ -2899,12 +2902,11 @@ func (s *AntigravityGatewayService) handleUpstreamError(
 		}
 		if modelKey != "" {
 			ra := s.resolveResetTime(resetAt, defaultDur)
-			if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, modelKey, ra); err != nil {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=429 model_rate_limit_set_failed model=%s error=%v", prefix, modelKey, err)
+			if !s.setAntigravityModelRateLimits(ctx, s.accountRepo, account, modelKey, prefix, statusCode, ra, false) {
+				logger.LegacyPrintf("service.antigravity_gateway", "%s status=429 model_rate_limit_set_failed model=%s", prefix, modelKey)
 			} else {
 				logger.LegacyPrintf("service.antigravity_gateway", "%s status=429 model_rate_limited model=%s account=%d reset_at=%v reset_in=%v",
 					prefix, modelKey, account.ID, ra.Format("15:04:05"), time.Until(ra).Truncate(time.Second))
-				s.updateAccountModelRateLimitInCache(ctx, account, modelKey, ra)
 			}
 			return nil
 		}
