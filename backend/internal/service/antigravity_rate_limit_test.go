@@ -1124,3 +1124,53 @@ func TestSchedulerSnapshotService_UpdateAccountInCache(t *testing.T) {
 		require.ErrorIs(t, err, expectedErr)
 	})
 }
+func TestNormalizeAntigravityModelName(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    string
+		expected string
+	}{
+		{
+			name:     "plain model name",
+			model:    "gemini-1.5-pro",
+			expected: "gemini-1.5-pro",
+		},
+		{
+			name:     "models/ prefix",
+			model:    "models/gemini-1.5-pro",
+			expected: "gemini-1.5-pro",
+		},
+		{
+			name:     "publishers/google/models/ prefix",
+			model:    "publishers/google/models/gemini-1.5-pro",
+			expected: "gemini-1.5-pro",
+		},
+		{
+			name:     "projects/.../publishers/google/models/ path",
+			model:    "projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.5-flash",
+			expected: "gemini-2.5-flash",
+		},
+		{
+			name:     "publishers/anthropic/models/ prefix",
+			model:    "publishers/anthropic/models/claude-sonnet-4-5",
+			expected: "claude-sonnet-4-5",
+		},
+		{
+			name:     "projects/.../publishers/anthropic/models/ path",
+			model:    "projects/my-proj/locations/global/publishers/anthropic/models/claude-sonnet-4-5",
+			expected: "claude-sonnet-4-5",
+		},
+		{
+			name:     "mixed case and spaces",
+			model:    "  Models/Gemini-1.5-Pro  ",
+			expected: "gemini-1.5-pro",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := normalizeAntigravityModelName(tt.model)
+			require.Equal(t, tt.expected, actual)
+		})
+	}
+}

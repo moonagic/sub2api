@@ -958,6 +958,7 @@ func mapAntigravityModel(account *Account, requestedModel string) string {
 	if account == nil {
 		return ""
 	}
+	requestedModel = strings.TrimPrefix(requestedModel, "models/")
 
 	// 获取映射表（未配置时自动使用 DefaultAntigravityModelMapping）
 	mapping := account.GetModelMapping()
@@ -2628,7 +2629,7 @@ func parseAntigravitySmartRetryInfo(body []byte) *antigravitySmartRetryInfo {
 		if atType == googleRPCTypeErrorInfo {
 			if meta, ok := dm["metadata"].(map[string]any); ok {
 				if model, ok := meta["model"].(string); ok {
-					modelName = model
+					modelName = normalizeAntigravityModelName(model)
 				}
 			}
 			// 检查 reason
