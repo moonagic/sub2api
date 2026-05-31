@@ -1138,16 +1138,20 @@ func testConnectionHandleError(
 }
 
 const (
-	antigravityGeminiTestDefaultMaxOutputTokens  = 1
-	antigravityGeminiTestThinkingMaxOutputTokens = antigravity.GeminiThinkingHighBudgetTokens + antigravity.MaxTokensBudgetPadding
+	antigravityGeminiTestDefaultMaxOutputTokens = 1
+	// Gemini 3+ 的 high 档推理需要足够的输出空间。maxOutputTokens 只是上限而非预留，
+	// 计费按实际生成 token，因此对测试成本无额外影响。取值对齐真实 Antigravity 客户端。
+	antigravityGeminiTestHighThinkingMaxOutputTokens = 32000
 )
 
 // buildGeminiTestRequest 构建 Gemini 格式测试请求
-// 普通模型使用最小 token 消耗；高阶 thinking 模型需要给上游保留推理预算空间。
+// 普通模型使用最小 token 消耗；Gemini 3+ high 档需要给推理留出输出空间。
+// thinking 强度通过 thinkingLevel（由 normalizeGeminiThinkingConfigForModel 按模型后缀注入）控制，
+// 不再发送 Gemini 3 不兼容的 thinkingBudget。
 func (s *AntigravityGatewayService) buildGeminiTestRequest(projectID, model string) ([]byte, error) {
 	maxOutputTokens := antigravityGeminiTestDefaultMaxOutputTokens
-	if budget, ok := antigravity.GeminiRequiredThinkingBudgetForModel(model); ok {
-		maxOutputTokens = budget + antigravity.MaxTokensBudgetPadding
+	if level, ok := antigravity.GeminiThinkingLevelForModel(model); ok && level == antigravity.GeminiThinkingLevelHigh {
+		maxOutputTokens = antigravityGeminiTestHighThinkingMaxOutputTokens
 	}
 
 	payload := map[string]any{
@@ -1318,9 +1322,17 @@ func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
 	return json.Marshal(request)
 }
 
+// normalizeGeminiThinkingConfigForModel 将 Gemini 3+ 模型的 thinking 配置规整为 thinkingLevel 形式。
+//
+// Gemini 3 使用 thinkingLevel（"low"/"high"）控制推理强度，而非 Gemini 2.5 时代的数值
+// thinkingBudget；二者互斥，向 Gemini 3 模型发送 thinkingBudget 会触发上游
+// 400 INVALID_ARGUMENT。处理规则：
+//   - 模型名带 -high/-low 后缀：按后缀强制 thinkingLevel，并清除任何 thinkingBudget。
+//   - 其他 Gemini 3+ 模型（如 gemini-3-flash）：仅清除调用方误传的 thinkingBudget，
+//     不强制 level（交由上游默认）。
 func normalizeGeminiThinkingConfigForModel(body []byte, model string) ([]byte, error) {
-	requiredBudget, ok := antigravity.GeminiRequiredThinkingBudgetForModel(model)
-	if !ok {
+	level, hasLevel := antigravity.GeminiThinkingLevelForModel(model)
+	if !hasLevel && !antigravity.IsGemini3PlusModel(model) {
 		return body, nil
 	}
 
@@ -1331,52 +1343,32 @@ func normalizeGeminiThinkingConfigForModel(body []byte, model string) ([]byte, e
 
 	rawConfig, ok := payload["generationConfig"].(map[string]any)
 	if !ok {
+		// 无 generationConfig：仅当需要强制 level 时才创建。
+		if !hasLevel {
+			return body, nil
+		}
 		rawConfig = map[string]any{}
 		payload["generationConfig"] = rawConfig
 	}
 
 	rawThinking, ok := rawConfig["thinkingConfig"].(map[string]any)
 	if !ok {
+		// 无 thinkingConfig 且无需强制 level（非后缀 Gemini 3 模型）：无需处理。
+		if !hasLevel {
+			return body, nil
+		}
 		rawThinking = map[string]any{}
 		rawConfig["thinkingConfig"] = rawThinking
 	}
 
-	currentBudget := int64(0)
-	switch budget := rawThinking["thinkingBudget"].(type) {
-	case float64:
-		currentBudget = int64(budget)
-	case int:
-		currentBudget = int64(budget)
-	case int64:
-		currentBudget = budget
-	case json.Number:
-		if parsed, err := budget.Int64(); err == nil {
-			currentBudget = parsed
-		}
-	}
-	if currentBudget < int64(requiredBudget) {
-		rawThinking["thinkingBudget"] = requiredBudget
-	}
+	// Gemini 3 不接受 thinkingBudget，一律清除（含 snake_case 形式）。
+	delete(rawThinking, "thinkingBudget")
 	delete(rawThinking, "thinking_budget")
-	delete(rawThinking, "thinkingLevel")
 	delete(rawThinking, "thinking_level")
 
-	currentMaxOutputTokens := int64(0)
-	switch maxOutputTokens := rawConfig["maxOutputTokens"].(type) {
-	case float64:
-		currentMaxOutputTokens = int64(maxOutputTokens)
-	case int:
-		currentMaxOutputTokens = int64(maxOutputTokens)
-	case int64:
-		currentMaxOutputTokens = maxOutputTokens
-	case json.Number:
-		if parsed, err := maxOutputTokens.Int64(); err == nil {
-			currentMaxOutputTokens = parsed
-		}
-	}
-	minMaxOutputTokens := int64(requiredBudget + antigravity.MaxTokensBudgetPadding)
-	if currentMaxOutputTokens < minMaxOutputTokens {
-		rawConfig["maxOutputTokens"] = minMaxOutputTokens
+	// 按模型后缀强制 thinkingLevel；保留调用方的 includeThoughts 语义。
+	if hasLevel {
+		rawThinking["thinkingLevel"] = level
 	}
 
 	return json.Marshal(payload)

@@ -331,17 +331,19 @@ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
 			wantPresent: true,
 		},
 		{
-			name:        "gemini 3.1 pro high uses required thinkingBudget",
+			name:        "gemini 3.1 pro high uses thinkingLevel high (no budget)",
 			model:       "gemini-3.1-pro-high",
 			thinking:    &ThinkingConfig{Type: "enabled", BudgetTokens: 1024},
-			wantBudget:  GeminiThinkingHighBudgetTokens,
+			wantBudget:  0,
+			wantLevel:   GeminiThinkingLevelHigh,
 			wantPresent: true,
 		},
 		{
-			name:        "gemini 3.1 pro low uses low thinkingBudget",
+			name:        "gemini 3.1 pro low uses thinkingLevel low (no budget)",
 			model:       "gemini-3.1-pro-low",
 			thinking:    &ThinkingConfig{Type: "enabled"},
-			wantBudget:  GeminiThinkingLowBudgetTokens,
+			wantBudget:  0,
+			wantLevel:   GeminiThinkingLevelLow,
 			wantPresent: true,
 		},
 		{
@@ -394,15 +396,14 @@ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
 	}
 }
 
-func TestBuildGenerationConfig_GeminiHighAddsRequiredThinkingBudget(t *testing.T) {
+func TestBuildGenerationConfig_GeminiHighUsesThinkingLevel(t *testing.T) {
 	cfg := buildGenerationConfig(&ClaudeRequest{Model: "gemini-3.1-pro-high"})
 
 	require.NotNil(t, cfg)
 	require.NotNil(t, cfg.ThinkingConfig)
-	require.Equal(t, GeminiThinkingHighBudgetTokens, cfg.ThinkingConfig.ThinkingBudget)
-	require.Empty(t, cfg.ThinkingConfig.ThinkingLevel)
+	require.Equal(t, GeminiThinkingLevelHigh, cfg.ThinkingConfig.ThinkingLevel)
+	require.Zero(t, cfg.ThinkingConfig.ThinkingBudget)
 	require.False(t, cfg.ThinkingConfig.IncludeThoughts)
-	require.Greater(t, cfg.MaxOutputTokens, cfg.ThinkingConfig.ThinkingBudget)
 }
 
 func TestTransformClaudeToGeminiWithOptions_PreservesBillingHeaderSystemBlock(t *testing.T) {
