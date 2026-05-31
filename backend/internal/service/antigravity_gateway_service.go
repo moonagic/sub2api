@@ -1304,6 +1304,36 @@ func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
 	return json.Marshal(request)
 }
 
+func normalizeGeminiThinkingConfigForModel(body []byte, model string) ([]byte, error) {
+	level, ok := antigravity.GeminiThinkingLevelForModel(model)
+	if !ok {
+		return body, nil
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+
+	rawConfig, ok := payload["generationConfig"].(map[string]any)
+	if !ok {
+		rawConfig = map[string]any{}
+		payload["generationConfig"] = rawConfig
+	}
+
+	rawThinking, ok := rawConfig["thinkingConfig"].(map[string]any)
+	if !ok {
+		rawThinking = map[string]any{}
+		rawConfig["thinkingConfig"] = rawThinking
+	}
+
+	delete(rawThinking, "thinkingBudget")
+	delete(rawThinking, "thinking_budget")
+	rawThinking["thinkingLevel"] = level
+
+	return json.Marshal(payload)
+}
+
 // wrapV1InternalRequest 包装请求为 v1internal 格式
 func (s *AntigravityGatewayService) wrapV1InternalRequest(projectID, model string, originalBody []byte) ([]byte, error) {
 	var request any
@@ -2178,6 +2208,12 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		logger.LegacyPrintf("service.antigravity_gateway", "[Antigravity] Failed to clean schema: %v", err)
 	}
 
+	if normalizedBody, err := normalizeGeminiThinkingConfigForModel(injectedBody, mappedModel); err == nil {
+		injectedBody = normalizedBody
+	} else {
+		return nil, s.writeGoogleError(c, http.StatusBadRequest, "Invalid request body")
+	}
+
 	// 包装请求
 	wrappedBody, err := s.wrapV1InternalRequest(projectID, mappedModel, injectedBody)
 	if err != nil {
@@ -2243,7 +2279,11 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 			if fallbackModel != "" && fallbackModel != mappedModel {
 				logger.LegacyPrintf("service.antigravity_gateway", "[Antigravity] Model not found (%s), retrying with fallback model %s (account: %s)", mappedModel, fallbackModel, account.Name)
 
-				fallbackWrapped, err := s.wrapV1InternalRequest(projectID, fallbackModel, injectedBody)
+				fallbackInjectedBody := injectedBody
+				if normalizedFallbackBody, normalizeErr := normalizeGeminiThinkingConfigForModel(injectedBody, fallbackModel); normalizeErr == nil {
+					fallbackInjectedBody = normalizedFallbackBody
+				}
+				fallbackWrapped, err := s.wrapV1InternalRequest(projectID, fallbackModel, fallbackInjectedBody)
 				if err == nil {
 					fallbackReq, err := antigravity.NewAPIRequest(ctx, upstreamAction, accessToken, fallbackWrapped)
 					if err == nil {

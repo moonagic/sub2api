@@ -18,6 +18,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // antigravityFailingWriter 模拟客户端断开连接的 gin.ResponseWriter
@@ -678,6 +679,125 @@ func TestAntigravityGatewayService_ForwardGemini_BillsWithMappedModel(t *testing
 	require.NotNil(t, result)
 	require.Equal(t, "gemini-2.5-flash", result.Model)
 	require.Equal(t, mappedModel, result.UpstreamModel)
+}
+
+func TestAntigravityGatewayService_ForwardGemini_NormalizesThinkingLevelForHighModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{"role": "user", "parts": []map[string]any{{"text": "hello"}}},
+		},
+		"generationConfig": map[string]any{
+			"thinkingConfig": map[string]any{
+				"includeThoughts": true,
+				"thinkingBudget":  1024,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1beta/models/gemini-3.1-pro-high:streamGenerateContent", bytes.NewReader(body))
+	c.Request = req
+
+	upstreamBody := []byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":3}}}\n\n")
+	upstream := &queuedHTTPUpstreamStub{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"X-Request-Id": []string{"req-thinking-level"}},
+				Body:       io.NopCloser(bytes.NewReader(upstreamBody)),
+			},
+		},
+	}
+
+	svc := &AntigravityGatewayService{
+		settingService: NewSettingService(&antigravitySettingRepoStub{}, &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}),
+		tokenProvider:  &AntigravityTokenProvider{},
+		httpUpstream:   upstream,
+	}
+
+	const model = "gemini-3.1-pro-high"
+	account := &Account{
+		ID:          61,
+		Name:        "acc-gemini-thinking",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+			"model_mapping": map[string]any{
+				model: model,
+			},
+		},
+	}
+
+	result, err := svc.ForwardGemini(context.Background(), c, account, model, "streamGenerateContent", true, body, false)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.requestBodies, 1)
+	require.Equal(t, "high", gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").String())
+	require.True(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.includeThoughts").Bool())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingBudget").Exists())
+}
+
+func TestAntigravityGatewayService_ForwardGemini_DoesNotForceIncludeThoughtsForHighModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{"role": "user", "parts": []map[string]any{{"text": "hello"}}},
+		},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1beta/models/gemini-3.1-pro-high:streamGenerateContent", bytes.NewReader(body))
+	c.Request = req
+
+	upstreamBody := []byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":3}}}\n\n")
+	upstream := &queuedHTTPUpstreamStub{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"X-Request-Id": []string{"req-thinking-level-no-include"}},
+				Body:       io.NopCloser(bytes.NewReader(upstreamBody)),
+			},
+		},
+	}
+
+	svc := &AntigravityGatewayService{
+		settingService: NewSettingService(&antigravitySettingRepoStub{}, &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}),
+		tokenProvider:  &AntigravityTokenProvider{},
+		httpUpstream:   upstream,
+	}
+
+	const model = "gemini-3.1-pro-high"
+	account := &Account{
+		ID:          62,
+		Name:        "acc-gemini-thinking-no-include",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+			"model_mapping": map[string]any{
+				model: model,
+			},
+		},
+	}
+
+	result, err := svc.ForwardGemini(context.Background(), c, account, model, "streamGenerateContent", true, body, false)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.requestBodies, 1)
+	require.Equal(t, "high", gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").String())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.includeThoughts").Exists())
 }
 
 func TestAntigravityGatewayService_ForwardGemini_RetriesCorruptedThoughtSignature(t *testing.T) {

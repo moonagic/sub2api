@@ -292,6 +292,7 @@ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
 		model       string
 		thinking    *ThinkingConfig
 		wantBudget  int
+		wantLevel   string
 		wantPresent bool
 	}{
 		{
@@ -330,6 +331,22 @@ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
 			wantPresent: true,
 		},
 		{
+			name:        "gemini 3.1 pro high uses thinkingLevel instead of thinkingBudget",
+			model:       "gemini-3.1-pro-high",
+			thinking:    &ThinkingConfig{Type: "enabled", BudgetTokens: 1024},
+			wantBudget:  0,
+			wantLevel:   GeminiThinkingLevelHigh,
+			wantPresent: true,
+		},
+		{
+			name:        "gemini 3.1 pro low uses low thinkingLevel",
+			model:       "gemini-3.1-pro-low",
+			thinking:    &ThinkingConfig{Type: "enabled"},
+			wantBudget:  0,
+			wantLevel:   GeminiThinkingLevelLow,
+			wantPresent: true,
+		},
+		{
 			name:        "disabled does not emit thinkingConfig",
 			model:       "claude-opus-4-6-thinking",
 			thinking:    &ThinkingConfig{Type: "disabled", BudgetTokens: 1024},
@@ -365,6 +382,9 @@ func TestBuildGenerationConfig_ThinkingDynamicBudget(t *testing.T) {
 				}
 				if cfg.ThinkingConfig.ThinkingBudget != tt.wantBudget {
 					t.Fatalf("expected thinkingBudget=%d, got %d", tt.wantBudget, cfg.ThinkingConfig.ThinkingBudget)
+				}
+				if cfg.ThinkingConfig.ThinkingLevel != tt.wantLevel {
+					t.Fatalf("expected thinkingLevel=%q, got %q", tt.wantLevel, cfg.ThinkingConfig.ThinkingLevel)
 				}
 				return
 			}
