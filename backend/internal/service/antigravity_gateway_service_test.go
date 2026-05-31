@@ -207,6 +207,38 @@ func (s *antigravitySettingRepoStub) Delete(ctx context.Context, key string) err
 	panic("unexpected Delete call")
 }
 
+func TestAntigravityGatewayService_BuildGeminiTestRequest_UsesRequiredThinkingBudget(t *testing.T) {
+	svc := &AntigravityGatewayService{}
+
+	body, err := svc.buildGeminiTestRequest("project-1", "gemini-3.1-pro-high")
+	require.NoError(t, err)
+
+	require.Equal(t, "gemini-3.1-pro-high", gjson.GetBytes(body, "model").String())
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens), gjson.GetBytes(body, "request.generationConfig.thinkingConfig.thinkingBudget").Int())
+	require.Equal(t, int64(antigravityGeminiTestThinkingMaxOutputTokens), gjson.GetBytes(body, "request.generationConfig.maxOutputTokens").Int())
+	require.False(t, gjson.GetBytes(body, "request.generationConfig.thinkingConfig.thinkingLevel").Exists())
+}
+
+func TestAntigravityGatewayService_BuildGeminiTestRequest_KeepsMinimalBudgetForLowModel(t *testing.T) {
+	svc := &AntigravityGatewayService{}
+
+	body, err := svc.buildGeminiTestRequest("project-1", "gemini-3.1-pro-low")
+	require.NoError(t, err)
+
+	require.False(t, gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists())
+	require.Equal(t, int64(antigravityGeminiTestDefaultMaxOutputTokens), gjson.GetBytes(body, "request.generationConfig.maxOutputTokens").Int())
+}
+
+func TestAntigravityGatewayService_BuildGeminiTestRequest_KeepsMinimalBudgetForNonThinkingModel(t *testing.T) {
+	svc := &AntigravityGatewayService{}
+
+	body, err := svc.buildGeminiTestRequest("project-1", "gemini-3-flash")
+	require.NoError(t, err)
+
+	require.Equal(t, int64(antigravityGeminiTestDefaultMaxOutputTokens), gjson.GetBytes(body, "request.generationConfig.maxOutputTokens").Int())
+	require.False(t, gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists())
+}
+
 func TestAntigravityGatewayService_Forward_PromptTooLong(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	writer := httptest.NewRecorder()
@@ -681,7 +713,7 @@ func TestAntigravityGatewayService_ForwardGemini_BillsWithMappedModel(t *testing
 	require.Equal(t, mappedModel, result.UpstreamModel)
 }
 
-func TestAntigravityGatewayService_ForwardGemini_NormalizesThinkingLevelForHighModel(t *testing.T) {
+func TestAntigravityGatewayService_ForwardGemini_NormalizesThinkingBudgetForHighModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	writer := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(writer)
@@ -739,9 +771,10 @@ func TestAntigravityGatewayService_ForwardGemini_NormalizesThinkingLevelForHighM
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Len(t, upstream.requestBodies, 1)
-	require.Equal(t, "high", gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").String())
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens), gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingBudget").Int())
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens+antigravity.MaxTokensBudgetPadding), gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.maxOutputTokens").Int())
 	require.True(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.includeThoughts").Bool())
-	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingBudget").Exists())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").Exists())
 }
 
 func TestAntigravityGatewayService_ForwardGemini_DoesNotForceIncludeThoughtsForHighModel(t *testing.T) {
@@ -796,7 +829,69 @@ func TestAntigravityGatewayService_ForwardGemini_DoesNotForceIncludeThoughtsForH
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Len(t, upstream.requestBodies, 1)
-	require.Equal(t, "high", gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").String())
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens), gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingBudget").Int())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").Exists())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.includeThoughts").Exists())
+}
+
+func TestAntigravityGatewayService_ForwardGemini_AddsRequiredThinkingBudgetWhenMissing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{"role": "user", "parts": []map[string]any{{"text": "hello"}}},
+		},
+		"generationConfig": map[string]any{
+			"maxOutputTokens": 1,
+		},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1beta/models/gemini-3.1-pro-high:streamGenerateContent", bytes.NewReader(body))
+	c.Request = req
+
+	upstreamBody := []byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":3}}}\n\n")
+	upstream := &queuedHTTPUpstreamStub{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"X-Request-Id": []string{"req-thinking-budget-missing"}},
+				Body:       io.NopCloser(bytes.NewReader(upstreamBody)),
+			},
+		},
+	}
+
+	svc := &AntigravityGatewayService{
+		settingService: NewSettingService(&antigravitySettingRepoStub{}, &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}),
+		tokenProvider:  &AntigravityTokenProvider{},
+		httpUpstream:   upstream,
+	}
+
+	const model = "gemini-3.1-pro-high"
+	account := &Account{
+		ID:          63,
+		Name:        "acc-gemini-thinking-budget-missing",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+			"model_mapping": map[string]any{
+				model: model,
+			},
+		},
+	}
+
+	result, err := svc.ForwardGemini(context.Background(), c, account, model, "streamGenerateContent", true, body, false)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.requestBodies, 1)
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens), gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingBudget").Int())
+	require.Equal(t, int64(antigravity.GeminiThinkingHighBudgetTokens+antigravity.MaxTokensBudgetPadding), gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.maxOutputTokens").Int())
+	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.thinkingLevel").Exists())
 	require.False(t, gjson.GetBytes(upstream.requestBodies[0], "request.generationConfig.thinkingConfig.includeThoughts").Exists())
 }
 

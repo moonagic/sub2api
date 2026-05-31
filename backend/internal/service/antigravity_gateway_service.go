@@ -1137,9 +1137,19 @@ func testConnectionHandleError(
 	return nil
 }
 
+const (
+	antigravityGeminiTestDefaultMaxOutputTokens  = 1
+	antigravityGeminiTestThinkingMaxOutputTokens = antigravity.GeminiThinkingHighBudgetTokens + antigravity.MaxTokensBudgetPadding
+)
+
 // buildGeminiTestRequest 构建 Gemini 格式测试请求
-// 使用最小 token 消耗：输入 "." + maxOutputTokens: 1
+// 普通模型使用最小 token 消耗；高阶 thinking 模型需要给上游保留推理预算空间。
 func (s *AntigravityGatewayService) buildGeminiTestRequest(projectID, model string) ([]byte, error) {
+	maxOutputTokens := antigravityGeminiTestDefaultMaxOutputTokens
+	if budget, ok := antigravity.GeminiRequiredThinkingBudgetForModel(model); ok {
+		maxOutputTokens = budget + antigravity.MaxTokensBudgetPadding
+	}
+
 	payload := map[string]any{
 		"contents": []map[string]any{
 			{
@@ -1156,11 +1166,15 @@ func (s *AntigravityGatewayService) buildGeminiTestRequest(projectID, model stri
 			},
 		},
 		"generationConfig": map[string]any{
-			"maxOutputTokens": 1,
+			"maxOutputTokens": maxOutputTokens,
 		},
 	}
 	payloadBytes, _ := json.Marshal(payload)
-	return s.wrapV1InternalRequest(projectID, model, payloadBytes)
+	normalizedBody, err := normalizeGeminiThinkingConfigForModel(payloadBytes, model)
+	if err != nil {
+		return nil, err
+	}
+	return s.wrapV1InternalRequest(projectID, model, normalizedBody)
 }
 
 // buildClaudeTestRequest 构建 Claude 格式测试请求并转换为 Gemini 格式
@@ -1305,7 +1319,7 @@ func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
 }
 
 func normalizeGeminiThinkingConfigForModel(body []byte, model string) ([]byte, error) {
-	level, ok := antigravity.GeminiThinkingLevelForModel(model)
+	requiredBudget, ok := antigravity.GeminiRequiredThinkingBudgetForModel(model)
 	if !ok {
 		return body, nil
 	}
@@ -1327,9 +1341,43 @@ func normalizeGeminiThinkingConfigForModel(body []byte, model string) ([]byte, e
 		rawConfig["thinkingConfig"] = rawThinking
 	}
 
-	delete(rawThinking, "thinkingBudget")
+	currentBudget := int64(0)
+	switch budget := rawThinking["thinkingBudget"].(type) {
+	case float64:
+		currentBudget = int64(budget)
+	case int:
+		currentBudget = int64(budget)
+	case int64:
+		currentBudget = budget
+	case json.Number:
+		if parsed, err := budget.Int64(); err == nil {
+			currentBudget = parsed
+		}
+	}
+	if currentBudget < int64(requiredBudget) {
+		rawThinking["thinkingBudget"] = requiredBudget
+	}
 	delete(rawThinking, "thinking_budget")
-	rawThinking["thinkingLevel"] = level
+	delete(rawThinking, "thinkingLevel")
+	delete(rawThinking, "thinking_level")
+
+	currentMaxOutputTokens := int64(0)
+	switch maxOutputTokens := rawConfig["maxOutputTokens"].(type) {
+	case float64:
+		currentMaxOutputTokens = int64(maxOutputTokens)
+	case int:
+		currentMaxOutputTokens = int64(maxOutputTokens)
+	case int64:
+		currentMaxOutputTokens = maxOutputTokens
+	case json.Number:
+		if parsed, err := maxOutputTokens.Int64(); err == nil {
+			currentMaxOutputTokens = parsed
+		}
+	}
+	minMaxOutputTokens := int64(requiredBudget + antigravity.MaxTokensBudgetPadding)
+	if currentMaxOutputTokens < minMaxOutputTokens {
+		rawConfig["maxOutputTokens"] = minMaxOutputTokens
+	}
 
 	return json.Marshal(payload)
 }
